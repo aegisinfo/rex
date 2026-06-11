@@ -89,4 +89,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-Built by [Niklas Borneklint](https://aegiscloud.org) · part of the [AEGIS](https://github.com/aegisinfo) ecosystem
+Built by [Niklas Borneklint](https://aegiscloud.org) · part of the [ÆGIS](https://github.com/aegisinfo) ecosystem
