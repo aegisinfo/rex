@@ -592,6 +592,7 @@ Reply with ONLY the shell command(s) to fix this. Rules:
 
 class OllamaWorker(QThread):
     result_ready = pyqtSignal(str)
+    status_update = pyqtSignal(str)
 
     def __init__(self, prompt: str, model: str, base_url: str):
         super().__init__()
@@ -599,7 +600,38 @@ class OllamaWorker(QThread):
         self.model    = model
         self.base_url = base_url
 
+    def _model_exists(self) -> bool:
+        """Return True if the model is already pulled locally."""
+        try:
+            url = self.base_url.rstrip("/") + "/api/tags"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+                names = [m.get("name", "").split(":")[0] for m in data.get("models", [])]
+                return self.model.split(":")[0] in names
+        except Exception:
+            return False
+
+    def _pull_model(self) -> bool:
+        """Pull the model via Ollama API. Returns True on success."""
+        try:
+            self.status_update.emit(f"Pulling model '{self.model}'… (first run only)")
+            url     = self.base_url.rstrip("/") + "/api/pull"
+            payload = json.dumps({"name": self.model, "stream": False}).encode()
+            req     = urllib.request.Request(
+                url, data=payload, headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                data = json.loads(resp.read())
+                return data.get("status") == "success"
+        except Exception as e:
+            self.result_ready.emit(f"[Pull failed: {e}]")
+            return False
+
     def run(self):
+        if not self._model_exists():
+            if not self._pull_model():
+                return
+
         url     = self.base_url.rstrip("/") + "/api/generate"
         payload = json.dumps({
             "model": self.model,
@@ -610,7 +642,7 @@ class OllamaWorker(QThread):
             url, data=payload, headers={"Content-Type": "application/json"}
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 data = json.loads(resp.read())
                 self.result_ready.emit(data.get("response", "").strip())
         except urllib.error.URLError as e:
@@ -689,7 +721,11 @@ class RemediationDialog(QDialog):
         )
         self._worker = OllamaWorker(prompt, ollama_model, ollama_url)
         self._worker.result_ready.connect(self._on_result)
+        self._worker.status_update.connect(self._on_status)
         self._worker.start()
+
+    def _on_status(self, msg: str):
+        self.fix_view.setPlaceholderText(msg)
 
     def _on_result(self, text: str):
         self.fix_view.setPlainText(text)
