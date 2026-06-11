@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: rex-linux
+            binary: dist/rex
+          - os: macos-latest
+            artifact: rex-macos
+            binary: dist/rex
+          - os: windows-latest
+            artifact: rex-windows
+            binary: dist/rex.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install PyQt6 psutil pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --onefile --windowed --name rex rex.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Rename binaries
+        run: |
+          mv artifacts/rex-linux/rex    artifacts/rex-linux
+          mv artifacts/rex-macos/rex    artifacts/rex-macos
+          mv artifacts/rex-windows/rex.exe artifacts/rex-windows.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/rex-linux
+            artifacts/rex-macos
+            artifacts/rex-windows.exe
+          generate_release_notes: true
