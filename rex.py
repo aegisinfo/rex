@@ -17,6 +17,11 @@ import shutil
 import urllib.request
 import urllib.error
 import threading
+import math
+import random
+import stat
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from PyQt6.QtWidgets import (
@@ -42,7 +47,7 @@ IS_LINUX = _OS == "Linux"
 # ============================================================
 # KONFIGURATION
 # ============================================================
-VERSION  = "1.2.0"
+VERSION  = "1.3.0"
 APP_NAME = "ÆGIS Security Audit"
 
 COLORS = {
@@ -76,28 +81,94 @@ AUDIT_SECTIONS = [
     "Scheduled Tasks",
     "SUID/SGID Files",
     "World-Writable Files",
+    "Environment Secrets",
+    "Sensitive File Permissions",
 ]
 
 VIRUS_SECTION = "Virus Scan (ClamAV)"
 SECTIONS = AUDIT_SECTIONS + [VIRUS_SECTION]
 
 # ============================================================
-# GRID BAKGRUND
+# LATTICE BAKGRUND (diamond lattice — upgraded)
 # ============================================================
-class GridWidget(QWidget):
+class LatticeWidget(QWidget):
+    """Diamond lattice with breathing lines, traveling spark particles,
+    and drifting intersection nodes."""
+
+    _SPACING = 40
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._offset = 0.0
+        self._frame  = 0
+        # sparks: [progress 0→1, line_index, direction +1/-1]
+        self._sparks: list = []
+        self._timer  = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(33)  # ~30 FPS
+
+    def _tick(self):
+        s = self._SPACING
+        self._offset = (self._offset + 0.9) % s
+        self._frame += 1
+        # Spawn a new spark roughly every 55 frames (max 5 simultaneous)
+        if self._frame % 55 == 0 and len(self._sparks) < 5:
+            w = max(self.width(), 1)
+            h = max(self.height(), 1)
+            n_lines = (w + h * 2) // s + 4
+            self._sparks.append([0.0, random.randint(0, n_lines - 1),
+                                  random.choice([-1, 1])])
+        # Advance sparks; cull finished ones
+        self._sparks = [[p + 0.011, i, d] for p, i, d in self._sparks if p < 1.0]
+        self.update()
+
     def paintEvent(self, event):
         super().paintEvent(event)
-        painter = QPainter(self)
-        pen = QPen(QColor(0, 229, 192, 10))
-        pen.setWidth(1)
-        painter.setPen(pen)
-        step = 40
-        w, h = self.width(), self.height()
-        for x in range(0, w, step):
-            painter.drawLine(x, 0, x, h)
-        for y in range(0, h, step):
-            painter.drawLine(0, y, w, y)
-        painter.end()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h  = self.width(), self.height()
+        s     = self._SPACING
+        off   = self._offset
+        frame = self._frame
+
+        origins = list(range(-w - int(h * 1.5), w + int(h * 1.5), s))
+
+        # ── Per-line breathing alpha (sine wave, each line offset) ───────────
+        for idx, i in enumerate(origins):
+            a1 = max(2, int(5 + 5 * math.sin(frame * 0.018 + idx * 0.45)))
+            a2 = max(2, int(5 + 5 * math.sin(frame * 0.018 + idx * 0.45 + 1.1)))
+            p.setPen(QPen(QColor(0, 229, 192, a1), 1))
+            p.drawLine(int(i + off), 0, int(i + h + off), h)
+            p.setPen(QPen(QColor(0, 229, 192, a2), 1))
+            p.drawLine(int(i - off), h, int(i + h - off), 0)
+
+        # ── Drifting intersection nodes ──────────────────────────────────────
+        dot_off = int(off) % s
+        p.setPen(Qt.PenStyle.NoPen)
+        for nx in range(-s + dot_off, w + s, s):
+            for ny in range(-s + dot_off, h + s, s):
+                p.setBrush(QColor(0, 229, 192, 20))
+                p.drawEllipse(nx - 1, ny - 1, 3, 3)
+
+        # ── Traveling spark particles ────────────────────────────────────────
+        for progress, line_idx, direction in self._sparks:
+            if line_idx >= len(origins):
+                continue
+            i  = origins[line_idx]
+            t  = progress
+            if direction == 1:   # \ direction
+                sx, sy = int(i + off + t * h), int(t * h)
+            else:                # / direction
+                sx, sy = int(i + h - off - t * h), int(t * h)
+            if not (0 <= sx <= w and 0 <= sy <= h):
+                continue
+            # Layered glow: outer halo → bright core
+            for radius, alpha in ((10, 6), (5, 25), (2, 110), (1, 220)):
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 229, 192, alpha))
+                p.drawEllipse(sx - radius, sy - radius, radius * 2, radius * 2)
+
+        p.end()
 
 
 # ============================================================
@@ -119,15 +190,26 @@ class AuditWorker(QThread):
     def stop(self):
         self._stop = True
 
+    def _run_safe(self, section):
+        try:
+            return self._run_section(section)
+        except Exception as e:
+            return "error", str(e)
+
     def run(self):
-        for section in self.sections:
-            if self._stop:
-                break
-            try:
-                status, output = self._run_section(section)
-            except Exception as e:
-                status, output = "error", str(e)
-            self.section_done.emit(section, status, output)
+        max_workers = min(8, len(self.sections))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(self._run_safe, s): s
+                       for s in self.sections if not self._stop}
+            for future in as_completed(futures):
+                if self._stop:
+                    break
+                section = futures[future]
+                try:
+                    status, output = future.result()
+                except Exception as e:
+                    status, output = "error", str(e)
+                self.section_done.emit(section, status, output)
         self.all_done.emit()
 
     # ── helpers ──────────────────────────────────────────────
@@ -570,6 +652,83 @@ class AuditWorker(QThread):
             except Exception as e:
                 return "error", str(e)
 
+        # ── Environment Secrets ───────────────────────────────
+        elif section == "Environment Secrets":
+            SECRET_NAME = re.compile(
+                r"(key|token|secret|password|passwd|pwd|credential|auth|"
+                r"apikey|api_key|access_key|private|bearer|jwt|oauth|webhook)",
+                re.IGNORECASE,
+            )
+            SECRET_VAL = re.compile(
+                r"^[A-Za-z0-9+/]{32,}$"          # base64-like long string
+                r"|^[a-f0-9]{32,}$"               # hex hash
+                r"|^sk-[A-Za-z0-9]{20,}"          # OpenAI-style
+                r"|^ghp_|^ghs_|^github_pat_"      # GitHub tokens
+                r"|^xox[bpoas]-",                  # Slack tokens
+                re.IGNORECASE,
+            )
+            suspicious, clean = [], []
+            for k, v in os.environ.items():
+                if SECRET_NAME.search(k) or (v and SECRET_VAL.search(v)):
+                    masked = (v[:4] + "****" + v[-2:]) if len(v) > 6 else "****"
+                    suspicious.append(f"⚠  {k} = {masked}")
+                else:
+                    clean.append(k)
+            out_parts = []
+            if suspicious:
+                out_parts.append(
+                    f"=== Potential secrets ({len(suspicious)}) ===\n"
+                    + "\n".join(suspicious[:40])
+                    + ("\n[truncated…]" if len(suspicious) > 40 else "")
+                )
+            out_parts.append(
+                f"=== Clean variables ({len(clean)}) ===\n"
+                + ("None detected." if not clean else f"{len(clean)} variables — no suspicious names or values.")
+            )
+            return ("warn" if suspicious else "ok"), "\n\n".join(out_parts)
+
+        # ── Sensitive File Permissions ────────────────────────
+        elif section == "Sensitive File Permissions":
+            if IS_WIN:
+                return "ok", "[N/A on Windows] Unix file-mode checks not applicable."
+            HOME = os.path.expanduser("~")
+            checks = [
+                (os.path.join(HOME, ".ssh"),                    0o700, "~/.ssh/"),
+                (os.path.join(HOME, ".ssh", "id_rsa"),          0o600, "~/.ssh/id_rsa"),
+                (os.path.join(HOME, ".ssh", "id_ed25519"),      0o600, "~/.ssh/id_ed25519"),
+                (os.path.join(HOME, ".ssh", "authorized_keys"), 0o600, "~/.ssh/authorized_keys"),
+                (os.path.join(HOME, ".ssh", "config"),          0o600, "~/.ssh/config"),
+                (os.path.join(HOME, ".gnupg"),                  0o700, "~/.gnupg/"),
+                (os.path.join(HOME, ".aws", "credentials"),     0o600, "~/.aws/credentials"),
+                (os.path.join(HOME, ".netrc"),                  0o600, "~/.netrc"),
+            ]
+            # Scan home dir (depth ≤ 2) for .env / credentials files
+            for root, dirs, files in os.walk(HOME):
+                depth = root[len(HOME):].count(os.sep)
+                if depth > 2:
+                    dirs[:] = []
+                    continue
+                for fname in files:
+                    if fname in (".env", ".env.local", ".env.production",
+                                 "credentials.json", "secrets.json", ".envrc"):
+                        checks.append((os.path.join(root, fname), 0o600, fname))
+            issues, ok_items = [], []
+            for path, required, label in checks:
+                if not os.path.exists(path):
+                    continue
+                try:
+                    mode = stat.S_IMODE(os.stat(path).st_mode)
+                    if mode & ~required:
+                        issues.append(
+                            f"⚠  {label}: {oct(mode)} (should be ≤ {oct(required)})"
+                        )
+                    else:
+                        ok_items.append(f"✓  {label}: {oct(mode)}")
+                except Exception as e:
+                    issues.append(f"?  {label}: {e}")
+            out = ("\n".join(issues) + "\n\n" if issues else "") + "\n".join(ok_items)
+            return ("warn" if issues else "ok"), out.strip() or "No sensitive files found"
+
         return "ok", "Section not implemented"
 
 
@@ -955,7 +1114,7 @@ class SecurityAuditWindow(QMainWindow):
         """)
 
     def _build_ui(self):
-        central = GridWidget()
+        central = LatticeWidget()
         central.setAutoFillBackground(True)
         pal = central.palette()
         pal.setColor(QPalette.ColorRole.Window, QColor(COLORS["bg"]))
@@ -1307,22 +1466,62 @@ class SecurityAuditWindow(QMainWindow):
         self.lbl_section_status.setText("")
         self.scan_toolbar.setVisible(False)
 
+        # ── Audit score ──────────────────────────────────────────────
+        total = len(AUDIT_SECTIONS)
+        warn_count     = sum(1 for _, st, _ in warnings if st == "warn")
+        critical_count = sum(1 for _, st, _ in warnings if st in ("critical", "error"))
+        score = max(0, 100 - warn_count * 5 - critical_count * 15)
+        bar_filled = round(score / 5)   # 20-block bar, each block = 5 pts
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+        if score >= 80:
+            score_color = COLORS["green"]
+            grade = "GOOD"
+        elif score >= 50:
+            score_color = COLORS["orange"]
+            grade = "FAIR"
+        else:
+            score_color = COLORS["red"]
+            grade = "POOR"
+
+        score_html = (
+            f'<div style="margin-bottom:16px;padding:12px 14px;'
+            f'background:{COLORS["bg3"]};border-radius:6px;'
+            f'border:1px solid {score_color}33">'
+            f'<div style="color:{COLORS["text2"]};font-size:11px;margin-bottom:6px">'
+            f'AUDIT SCORE</div>'
+            f'<div style="display:flex;align-items:baseline;gap:12px">'
+            f'<span style="color:{score_color};font-size:28px;font-weight:bold">{score}</span>'
+            f'<span style="color:{score_color};font-size:12px;font-weight:bold">{grade}</span>'
+            f'<span style="color:{COLORS["text2"]};font-size:11px">'
+            f'/ 100 &nbsp;·&nbsp; {total - len(warnings)}/{total} sections clean</span>'
+            f'</div>'
+            f'<div style="color:{score_color};font-size:13px;letter-spacing:1px;margin-top:6px">'
+            f'{bar}</div>'
+            f'</div>'
+        )
+
         if not warnings:
-            html = (f'<div style="color:{COLORS["green"]};font-size:14px;font-weight:bold">'
-                    f'✓ All sections clean</div>')
-            self.output_view.setHtml(html)
+            self.output_view.setHtml(
+                f'<div style="font-family:\'JetBrains Mono\',\'Fira Mono\',monospace;'
+                f'background:{COLORS["bg2"]};color:{COLORS["text"]};padding:4px">'
+                + score_html
+                + f'<div style="color:{COLORS["green"]};font-size:13px;font-weight:bold">'
+                  f'✓ All sections clean</div></div>'
+            )
             return
 
         icon = {"warn": "⚠", "critical": "✖", "error": "✖"}
         color = {"warn": COLORS["orange"], "critical": COLORS["red"], "error": COLORS["red"]}
 
-        lines = [f'<div style="color:{COLORS["orange"]};font-size:13px;font-weight:bold;'
-                 f'margin-bottom:12px">{len(warnings)} issue(s) found — click a section for details</div>']
+        lines = [
+            score_html,
+            f'<div style="color:{COLORS["orange"]};font-size:12px;font-weight:bold;'
+            f'margin-bottom:12px">{len(warnings)} issue(s) found — click a section for details</div>',
+        ]
 
         for section, status, output in warnings:
             c = color.get(status, COLORS["orange"])
             ic = icon.get(status, "⚠")
-            # Show first 6 meaningful lines of output
             preview_lines = [l for l in output.splitlines() if l.strip()][:6]
             preview = "<br>".join(
                 f'<span style="color:{COLORS["text"]}">{l}</span>'
