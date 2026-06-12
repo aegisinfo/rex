@@ -57,15 +57,15 @@ jobs:
 
       - name: Rename binaries
         run: |
-          mv artifacts/rex-linux/rex    artifacts/rex-linux
-          mv artifacts/rex-macos/rex    artifacts/rex-macos
-          mv artifacts/rex-windows/rex.exe artifacts/rex-windows.exe
+          mv artifacts/rex-linux/rex    rex-linux
+          mv artifacts/rex-macos/rex    rex-macos
+          mv artifacts/rex-windows/rex.exe rex-windows.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/rex-linux
-            artifacts/rex-macos
-            artifacts/rex-windows.exe
+            rex-linux
+            rex-macos
+            rex-windows.exe
           generate_release_notes: true
