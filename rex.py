@@ -88,6 +88,26 @@ AUDIT_SECTIONS = [
 VIRUS_SECTION = "Virus Scan (ClamAV)"
 SECTIONS = AUDIT_SECTIONS + [VIRUS_SECTION]
 
+CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".aegis_config.json")
+
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_config(data: dict):
+    try:
+        existing = _load_config()
+        existing.update(data)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(existing, f, indent=2)
+        if not IS_WIN:
+            os.chmod(CONFIG_PATH, 0o600)
+    except Exception:
+        pass
+
 # ============================================================
 # LATTICE BAKGRUND (diamond lattice — upgraded)
 # ============================================================
@@ -830,6 +850,62 @@ class OllamaWorker(QThread):
             self.result_ready.emit(f"[Error: {e}]")
 
 
+class ClaudeWorker(QThread):
+    result_ready  = pyqtSignal(str)
+    token_ready   = pyqtSignal(str)
+    status_update = pyqtSignal(str)
+
+    def __init__(self, prompt: str, model: str, api_key: str):
+        super().__init__()
+        self.prompt  = prompt
+        self.model   = model
+        self.api_key = api_key
+
+    def run(self):
+        self.status_update.emit(f"Querying {self.model}…")
+        url = "https://api.anthropic.com/v1/messages"
+        payload = json.dumps({
+            "model": self.model,
+            "max_tokens": 1024,
+            "stream": True,
+            "messages": [{"role": "user", "content": self.prompt}],
+        }).encode()
+        req = urllib.request.Request(url, data=payload, headers={
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+        })
+        try:
+            full = []
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except Exception:
+                        continue
+                    if chunk.get("type") == "content_block_delta":
+                        token = chunk.get("delta", {}).get("text", "")
+                        if token:
+                            full.append(token)
+                            self.token_ready.emit(token)
+                    elif chunk.get("type") == "message_stop":
+                        break
+            self.result_ready.emit("".join(full).strip())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            self.result_ready.emit(f"[Claude API error {e.code}: {body[:300]}]")
+        except urllib.error.URLError as e:
+            self.result_ready.emit(f"[Claude unreachable: {e.reason}]")
+        except Exception as e:
+            self.result_ready.emit(f"[Error: {e}]")
+
+
 class ApplyWorker(QThread):
     progress = pyqtSignal(str)
     finished = pyqtSignal(str, str)  # summary, full output
@@ -886,7 +962,11 @@ class ApplyWorker(QThread):
 
 class RemediationDialog(QDialog):
     def __init__(self, parent, section: str, finding: str,
-                 ollama_url: str, ollama_model: str):
+                 provider: str = "ollama",
+                 ollama_url: str = "http://localhost:11434",
+                 ollama_model: str = "llama3.2",
+                 claude_api_key: str = "",
+                 claude_model: str = "claude-haiku-4-5-20251001"):
         super().__init__(parent)
         self.setWindowTitle(f"AI Fix — {section}")
         self.resize(700, 520)
@@ -923,7 +1003,8 @@ class RemediationDialog(QDialog):
         finding_view.setFixedHeight(120)
         layout.addWidget(finding_view)
 
-        lbl_fix = QLabel("🤖  Ollama suggestion  (you can edit before applying):")
+        provider_label = "Claude" if provider == "claude" else "Ollama"
+        lbl_fix = QLabel(f"🤖  {provider_label} suggestion  (you can edit before applying):")
         lbl_fix.setStyleSheet(f"color:{COLORS['cyan']};font-weight:bold;")
         layout.addWidget(lbl_fix)
 
@@ -952,11 +1033,14 @@ class RemediationDialog(QDialog):
         self.btn_apply.clicked.connect(self._apply)
         btn_skip.clicked.connect(self.reject)
 
-        # Start Ollama query in background QThread
+        # Start AI query in background QThread
         prompt = REMEDIATION_PROMPT.format(
             os=_OS, section=section, finding=finding[:1200]
         )
-        self._worker = OllamaWorker(prompt, ollama_model, ollama_url)
+        if provider == "claude":
+            self._worker = ClaudeWorker(prompt, claude_model, claude_api_key)
+        else:
+            self._worker = OllamaWorker(prompt, ollama_model, ollama_url)
         self._worker.status_update.connect(self._on_status)
         self._worker.token_ready.connect(self._on_token)
         self._worker.result_ready.connect(self._on_result)
@@ -1140,6 +1224,20 @@ class SecurityAuditWindow(QMainWindow):
         self.worker   = None
         self._apply_theme()
         self._build_ui()
+        self._restore_config()
+
+    def _restore_config(self):
+        cfg = _load_config()
+        if cfg.get("ollama_url"):
+            self.ollama_url.setText(cfg["ollama_url"])
+        if cfg.get("ollama_model"):
+            self.ollama_model.setText(cfg["ollama_model"])
+        if cfg.get("claude_api_key"):
+            self.claude_api_key.setText(cfg["claude_api_key"])
+        if cfg.get("claude_model"):
+            self.claude_model.setText(cfg["claude_model"])
+        if cfg.get("ai_provider") == "claude":
+            self.provider_combo.setCurrentIndex(1)
 
     def _apply_theme(self):
         self.setStyleSheet(f"""
@@ -1309,11 +1407,26 @@ class SecurityAuditWindow(QMainWindow):
 
         sb.addSpacing(8)
 
-        # ── Ollama settings ───────────────────────────────────
+        # ── AI Provider settings ──────────────────────────────
+        from PyQt6.QtWidgets import QComboBox
 
-        lbl_ollama = QLabel("Ollama")
-        lbl_ollama.setStyleSheet(f"color:{COLORS['text3']};font-size:10px;letter-spacing:1px;")
-        sb.addWidget(lbl_ollama)
+        lbl_ai = QLabel("AI Provider")
+        lbl_ai.setStyleSheet(f"color:{COLORS['text3']};font-size:10px;letter-spacing:1px;")
+        sb.addWidget(lbl_ai)
+
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItems(["Ollama", "Claude"])
+        self.provider_combo.setStyleSheet(
+            f"background:{COLORS['bg3']};color:{COLORS['text2']};border:1px solid {COLORS['border']};"
+            f"border-radius:4px;padding:3px 6px;font-size:10px;"
+        )
+        sb.addWidget(self.provider_combo)
+
+        # Ollama fields
+        self._ollama_widget = QWidget()
+        ollama_layout = QVBoxLayout(self._ollama_widget)
+        ollama_layout.setContentsMargins(0, 0, 0, 0)
+        ollama_layout.setSpacing(4)
 
         self.ollama_url = QLineEdit("http://localhost:11434")
         self.ollama_url.setPlaceholderText("Ollama URL")
@@ -1321,7 +1434,7 @@ class SecurityAuditWindow(QMainWindow):
             f"background:{COLORS['bg3']};color:{COLORS['text2']};border:1px solid {COLORS['border']};"
             f"border-radius:4px;padding:3px 6px;font-size:10px;"
         )
-        sb.addWidget(self.ollama_url)
+        ollama_layout.addWidget(self.ollama_url)
 
         self.ollama_model = QLineEdit("llama3.2")
         self.ollama_model.setPlaceholderText("model name")
@@ -1329,12 +1442,40 @@ class SecurityAuditWindow(QMainWindow):
             f"background:{COLORS['bg3']};color:{COLORS['text2']};border:1px solid {COLORS['border']};"
             f"border-radius:4px;padding:3px 6px;font-size:10px;"
         )
-        sb.addWidget(self.ollama_model)
+        ollama_layout.addWidget(self.ollama_model)
+        sb.addWidget(self._ollama_widget)
 
-        btn_ai_fix = QPushButton("🤖  AI Fix (Ollama)")
+        # Claude fields
+        self._claude_widget = QWidget()
+        claude_layout = QVBoxLayout(self._claude_widget)
+        claude_layout.setContentsMargins(0, 0, 0, 0)
+        claude_layout.setSpacing(4)
+
+        self.claude_api_key = QLineEdit()
+        self.claude_api_key.setPlaceholderText("sk-ant-… API key")
+        self.claude_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.claude_api_key.setStyleSheet(
+            f"background:{COLORS['bg3']};color:{COLORS['text2']};border:1px solid {COLORS['border']};"
+            f"border-radius:4px;padding:3px 6px;font-size:10px;"
+        )
+        claude_layout.addWidget(self.claude_api_key)
+
+        self.claude_model = QLineEdit("claude-haiku-4-5-20251001")
+        self.claude_model.setPlaceholderText("Claude model")
+        self.claude_model.setStyleSheet(
+            f"background:{COLORS['bg3']};color:{COLORS['text2']};border:1px solid {COLORS['border']};"
+            f"border-radius:4px;padding:3px 6px;font-size:10px;"
+        )
+        claude_layout.addWidget(self.claude_model)
+        self._claude_widget.setVisible(False)
+        sb.addWidget(self._claude_widget)
+
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_change)
+
+        btn_ai_fix = QPushButton("🤖  AI Fix")
         btn_ai_fix.clicked.connect(self._ai_fix_current)
         btn_ai_fix.setEnabled(False)
-        btn_ai_fix.setToolTip("Ask Ollama to suggest a fix for the selected section")
+        btn_ai_fix.setToolTip("Ask AI to suggest a fix for the selected section")
         sb.addWidget(btn_ai_fix)
         self.btn_ai_fix = btn_ai_fix
 
@@ -1403,6 +1544,12 @@ class SecurityAuditWindow(QMainWindow):
         root.addWidget(main_area)
 
         self.section_list.setCurrentRow(0)
+
+    def _on_provider_change(self, index: int):
+        is_claude = index == 1
+        self._ollama_widget.setVisible(not is_claude)
+        self._claude_widget.setVisible(is_claude)
+        _save_config({"ai_provider": "claude" if is_claude else "ollama"})
 
     def _browse_scan_path(self):
         path = QFileDialog.getExistingDirectory(self, "Select scan directory",
@@ -1683,10 +1830,21 @@ class SecurityAuditWindow(QMainWindow):
                 "Click on a ⚠ or ✖ section in the list first.")
             return
         try:
+            is_claude = self.provider_combo.currentIndex() == 1
+            provider  = "claude" if is_claude else "ollama"
+            api_key   = self.claude_api_key.text().strip()
+            if is_claude:
+                _save_config({
+                    "claude_api_key": api_key,
+                    "claude_model":   self.claude_model.text().strip(),
+                })
             dlg = RemediationDialog(
                 self, section, output,
+                provider=provider,
                 ollama_url=self.ollama_url.text().strip(),
                 ollama_model=self.ollama_model.text().strip(),
+                claude_api_key=api_key,
+                claude_model=self.claude_model.text().strip(),
             )
             dlg.exec()
             if dlg.applied_output:
