@@ -844,14 +844,12 @@ class ApplyWorker(QThread):
         results = []
         all_ok  = True
         for cmd in self.cmds:
-            if any(p in cmd for p in self.blocked_paths):
+            # Hard safety net — catches anything that slipped past the UI validator
+            danger = RemediationDialog._check_danger(cmd)
+            if danger or any(p in cmd for p in self.blocked_paths):
                 all_ok = False
-                results.append(
-                    f"⚠  $ {cmd}\n"
-                    f"[Requires root — run manually:\n"
-                    f"  sudo sh -c {repr(cmd)}\n"
-                    f"Or use visudo to edit sudoers safely.]"
-                )
+                reason = danger or "sensitive path"
+                results.append(f"⛔  $ {cmd}\n[Blocked: {reason} — not executed]")
                 continue
 
             run_cmd = cmd
@@ -976,13 +974,67 @@ class RemediationDialog(QDialog):
 
     def _on_result(self, text: str):
         if text.startswith("["):
-            # Error — show in status label and put in text area
             self.lbl_ai_status.setText(f"✖  {text}")
             self.fix_view.setPlainText(text)
             return
-        self.lbl_ai_status.setText("✓  Done — review and edit before applying")
-        usable = bool(text) and text != "NO_FIX_AVAILABLE"
-        self.btn_apply.setEnabled(usable)
+
+        if not text or text == "NO_FIX_AVAILABLE":
+            self.lbl_ai_status.setText("ℹ  No automated fix available for this finding.")
+            self.fix_view.setPlainText(text or "NO_FIX_AVAILABLE")
+            return
+
+        # Validate every command and annotate dangerous ones in-place
+        lines     = text.splitlines()
+        annotated = []
+        has_danger = False
+        for line in lines:
+            danger = self._check_danger(line.strip())
+            if danger:
+                has_danger = True
+                annotated.append(f"# ⛔ BLOCKED — {danger}\n# {line}")
+            else:
+                annotated.append(line)
+
+        self.fix_view.setPlainText("\n".join(annotated))
+
+        if has_danger:
+            self.lbl_ai_status.setText(
+                "⚠  Dangerous commands detected (blocked with # ⛔) — review before applying"
+            )
+            self.lbl_ai_status.setStyleSheet(f"color:{COLORS['orange']};font-size:11px;font-weight:bold;")
+        else:
+            self.lbl_ai_status.setText("✓  Done — review and edit before applying")
+        self.btn_apply.setEnabled(True)
+
+    # Patterns that indicate a command is too dangerous to auto-run.
+    # Each entry is (regex_pattern, human_reason).
+    _DANGER_PATTERNS = [
+        (r"sudoers",                  "modifies sudoers — use visudo"),
+        (r"/etc/shadow",              "modifies shadow password file"),
+        (r"/etc/passwd",              "modifies passwd file"),
+        (r"rm\s+-[a-z]*r[a-z]*f?\s+/(?!\S)",  "rm -rf on root"),
+        (r"rm\s+-[a-z]*f?[a-z]*r\s+/(?!\S)",  "rm -rf on root"),
+        (r">\s*/dev/sd[a-z]",         "overwrites block device"),
+        (r"dd\s+.*of=/dev/",          "dd to block device"),
+        (r"mkfs",                     "formats a filesystem"),
+        (r":()\s*\{",                 "fork bomb"),
+        (r"chmod\s+[0-9]*[0-7][0-7][0-7]\s+/etc/(?:passwd|shadow|sudoers|ssh)", "unsafe chmod on critical file"),
+        (r">\s*/etc/(?:passwd|shadow|sudoers|crontab|hosts)(?:\s|$)", "overwrites critical config"),
+        (r"curl\s+.*\|\s*(?:ba)?sh",  "remote code execution via pipe"),
+        (r"wget\s+.*-O\s*-\s*\|",     "remote code execution via pipe"),
+        (r"base64\s+.*\|\s*(?:ba)?sh","obfuscated remote execution"),
+        (r"!!!", "invalid sudoers syntax"),
+    ]
+
+    @classmethod
+    def _check_danger(cls, cmd: str) -> str:
+        """Return a human-readable reason if cmd is dangerous, else empty string."""
+        if not cmd or cmd.startswith("#"):
+            return ""
+        for pattern, reason in cls._DANGER_PATTERNS:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                return reason
+        return ""
 
     # These paths are too dangerous to auto-execute even with sudo — always show manually
     _BLOCKED_PATHS = (
