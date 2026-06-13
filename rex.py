@@ -735,22 +735,26 @@ class AuditWorker(QThread):
 # ============================================================
 # OLLAMA REMEDIATION
 # ============================================================
-REMEDIATION_PROMPT = """You are a {os} security expert. A security audit found this issue:
+REMEDIATION_PROMPT = """You are a {os} security hardening expert. A security audit found this issue:
 
 Section: {section}
 Finding:
 {finding}
 
-Reply with ONLY the shell command(s) to fix this. Rules:
-- Output raw commands only — no explanation, no markdown, no backticks, no numbers
+Output ONLY the exact shell commands needed to fix this specific finding. Follow these rules strictly:
+- Raw commands only — no explanation, no markdown, no code fences, no backticks, no bullets, no numbers
 - One command per line
-- If multiple steps are needed, put each on its own line
-- If nothing can be fixed with a command, output exactly: NO_FIX_AVAILABLE
+- Commands must be real, standard {os} commands that exist on this system
+- Do NOT invent commands — only use well-known tools (chmod, chown, systemctl, ufw, sysctl, sed, etc.)
+- Do NOT include ssh-agent, xauth, dbus, session management or unrelated daemon commands
+- If the fix requires editing a config file, use sed or echo with a redirect
+- If nothing can be fixed with a shell command, output exactly: NO_FIX_AVAILABLE
 - Do NOT output anything else"""
 
 
 class OllamaWorker(QThread):
-    result_ready = pyqtSignal(str)
+    result_ready  = pyqtSignal(str)   # final full text (or error string)
+    token_ready   = pyqtSignal(str)   # each streaming token
     status_update = pyqtSignal(str)
 
     def __init__(self, prompt: str, model: str, base_url: str):
@@ -760,7 +764,6 @@ class OllamaWorker(QThread):
         self.base_url = base_url
 
     def _model_exists(self) -> bool:
-        """Return True if the model is already pulled locally."""
         try:
             url = self.base_url.rstrip("/") + "/api/tags"
             with urllib.request.urlopen(url, timeout=10) as resp:
@@ -771,7 +774,6 @@ class OllamaWorker(QThread):
             return False
 
     def _pull_model(self) -> bool:
-        """Pull the model via Ollama API. Returns True on success."""
         try:
             self.status_update.emit(f"Pulling model '{self.model}'… (first run only)")
             url     = self.base_url.rstrip("/") + "/api/pull"
@@ -781,7 +783,10 @@ class OllamaWorker(QThread):
             )
             with urllib.request.urlopen(req, timeout=300) as resp:
                 data = json.loads(resp.read())
-                return data.get("status") == "success"
+                if data.get("status") == "success":
+                    return True
+                self.result_ready.emit(f"[Pull returned unexpected status: {data.get('status')}]")
+                return False
         except Exception as e:
             self.result_ready.emit(f"[Pull failed: {e}]")
             return False
@@ -791,23 +796,94 @@ class OllamaWorker(QThread):
             if not self._pull_model():
                 return
 
+        self.status_update.emit(f"Querying {self.model}…")
         url     = self.base_url.rstrip("/") + "/api/generate"
         payload = json.dumps({
-            "model": self.model,
+            "model":  self.model,
             "prompt": self.prompt,
-            "stream": False,
+            "stream": True,
         }).encode()
         req = urllib.request.Request(
             url, data=payload, headers={"Content-Type": "application/json"}
         )
         try:
+            full = []
             with urllib.request.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read())
-                self.result_ready.emit(data.get("response", "").strip())
+                for raw_line in resp:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except Exception:
+                        continue
+                    token = chunk.get("response", "")
+                    if token:
+                        full.append(token)
+                        self.token_ready.emit(token)
+                    if chunk.get("done"):
+                        break
+            self.result_ready.emit("".join(full).strip())
         except urllib.error.URLError as e:
             self.result_ready.emit(f"[Ollama unreachable: {e.reason}]")
         except Exception as e:
             self.result_ready.emit(f"[Error: {e}]")
+
+
+class ApplyWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str, str)  # summary, full output
+
+    def __init__(self, cmds, blocked_paths, sudo_paths):
+        super().__init__()
+        self.cmds          = cmds
+        self.blocked_paths = blocked_paths
+        self.sudo_paths    = sudo_paths
+
+    def run(self):
+        results = []
+        all_ok  = True
+        for cmd in self.cmds:
+            if any(p in cmd for p in self.blocked_paths):
+                all_ok = False
+                results.append(
+                    f"⚠  $ {cmd}\n"
+                    f"[Requires root — run manually:\n"
+                    f"  sudo sh -c {repr(cmd)}\n"
+                    f"Or use visudo to edit sudoers safely.]"
+                )
+                continue
+
+            run_cmd = cmd
+            if not cmd.startswith("sudo ") and any(p in cmd for p in self.sudo_paths):
+                run_cmd = "sudo -n " + cmd  # -n: fail immediately if password needed
+
+            self.progress.emit(f"$ {cmd}")
+            try:
+                r = subprocess.run(
+                    run_cmd, shell=True, capture_output=True, text=True, timeout=30
+                )
+                out = (r.stdout + r.stderr).strip() or "(no output)"
+                ok  = r.returncode == 0
+                if not ok:
+                    all_ok = False
+                    # sudo -n fails with "sudo: a password is required" — show manual hint
+                    if "password is required" in out or "a password is required" in out:
+                        results.append(
+                            f"⚠  $ {cmd}\n"
+                            f"[Needs sudo password — run manually:\n"
+                            f"  sudo {cmd}]"
+                        )
+                        continue
+                status  = "✓" if ok else f"✖ (exit {r.returncode})"
+                display = f"sudo {cmd}" if run_cmd != cmd else cmd
+                results.append(f"{status}  $ {display}\n{out}")
+            except Exception as e:
+                all_ok = False
+                results.append(f"✖  $ {cmd}\nError: {e}")
+
+        summary = "✓ All commands succeeded" if all_ok else "⚠ Some commands need manual review"
+        self.finished.emit(summary, "\n\n".join(results))
 
 
 class RemediationDialog(QDialog):
@@ -853,8 +929,12 @@ class RemediationDialog(QDialog):
         lbl_fix.setStyleSheet(f"color:{COLORS['cyan']};font-weight:bold;")
         layout.addWidget(lbl_fix)
 
+        self.lbl_ai_status = QLabel("⏳  Connecting to Ollama…")
+        self.lbl_ai_status.setStyleSheet(f"color:{COLORS['text2']};font-size:11px;")
+        layout.addWidget(self.lbl_ai_status)
+
         self.fix_view = QTextEdit()
-        self.fix_view.setPlaceholderText("Querying Ollama — please wait…")
+        self.fix_view.setPlaceholderText("Response will appear here…")
         layout.addWidget(self.fix_view)
 
         lbl_warn = QLabel("⚠  Always review the command before applying.")
@@ -879,16 +959,29 @@ class RemediationDialog(QDialog):
             os=_OS, section=section, finding=finding[:1200]
         )
         self._worker = OllamaWorker(prompt, ollama_model, ollama_url)
-        self._worker.result_ready.connect(self._on_result)
         self._worker.status_update.connect(self._on_status)
+        self._worker.token_ready.connect(self._on_token)
+        self._worker.result_ready.connect(self._on_result)
         self._worker.start()
 
     def _on_status(self, msg: str):
-        self.fix_view.setPlaceholderText(msg)
+        self.lbl_ai_status.setText(f"⏳  {msg}")
+
+    def _on_token(self, token: str):
+        self.lbl_ai_status.setText(f"✍  Generating…")
+        cursor = self.fix_view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.insertText(token)
+        self.fix_view.setTextCursor(cursor)
 
     def _on_result(self, text: str):
-        self.fix_view.setPlainText(text)
-        usable = text and not text.startswith("[") and text != "NO_FIX_AVAILABLE"
+        if text.startswith("["):
+            # Error — show in status label and put in text area
+            self.lbl_ai_status.setText(f"✖  {text}")
+            self.fix_view.setPlainText(text)
+            return
+        self.lbl_ai_status.setText("✓  Done — review and edit before applying")
+        usable = bool(text) and text != "NO_FIX_AVAILABLE"
         self.btn_apply.setEnabled(usable)
 
     # These paths are too dangerous to auto-execute even with sudo — always show manually
@@ -965,42 +1058,21 @@ class RemediationDialog(QDialog):
             self.applied_output = "No executable commands found in suggestion."
             self.accept()
             return
-        results = []
-        all_ok = True
-        for cmd in cmds:
-            # Hard-blocked paths: too sensitive to auto-execute — show for manual review
-            if any(p in cmd for p in self._BLOCKED_PATHS):
-                all_ok = False
-                results.append(
-                    f"⚠  $ {cmd}\n"
-                    f"[Requires root — run manually:\n"
-                    f"  sudo sh -c {repr(cmd)}\n"
-                    f"Or use visudo to edit sudoers safely.]"
-                )
-                continue
 
-            # Auto-prepend sudo for commands targeting system paths that need root
-            run_cmd = cmd
-            if (not cmd.startswith("sudo ")
-                    and any(p in cmd for p in self._SUDO_PATHS)):
-                run_cmd = "sudo " + cmd
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.setText("⏳  Running…")
+        self.lbl_ai_status.setText("⏳  Applying fix…")
 
-            try:
-                r = subprocess.run(
-                    run_cmd, shell=True, capture_output=True, text=True, timeout=30
-                )
-                out = (r.stdout + r.stderr).strip() or "(no output)"
-                ok = r.returncode == 0
-                if not ok:
-                    all_ok = False
-                status = "✓" if ok else f"✖ (exit {r.returncode})"
-                display = f"sudo {cmd}" if run_cmd != cmd else cmd
-                results.append(f"{status}  $ {display}\n{out}")
-            except Exception as e:
-                all_ok = False
-                results.append(f"✖  $ {cmd}\nError: {e}")
-        summary = "✓ All commands succeeded" if all_ok else "⚠ Some commands need manual review"
-        self.applied_output = f"{summary}\n\n" + "\n\n".join(results)
+        self._apply_worker = ApplyWorker(cmds, self._BLOCKED_PATHS, self._SUDO_PATHS)
+        self._apply_worker.progress.connect(self._on_apply_progress)
+        self._apply_worker.finished.connect(self._on_apply_done)
+        self._apply_worker.start()
+
+    def _on_apply_progress(self, line: str):
+        self.lbl_ai_status.setText(f"⏳  {line}")
+
+    def _on_apply_done(self, summary: str, output: str):
+        self.applied_output = f"{summary}\n\n{output}"
         self.accept()
 
 
