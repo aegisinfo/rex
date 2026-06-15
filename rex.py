@@ -16,7 +16,6 @@ import shlex
 import shutil
 import urllib.request
 import urllib.error
-import threading
 import math
 import random
 import stat
@@ -26,12 +25,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QPushButton, QLabel, QTextEdit, QScrollArea, QFrame, QSplitter,
-        QListWidget, QListWidgetItem, QProgressBar, QFileDialog, QSizePolicy,
+        QPushButton, QLabel, QTextEdit, QFrame,
+        QListWidget, QListWidgetItem, QProgressBar, QFileDialog,
         QDialog, QLineEdit
     )
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect
-    from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QFontDatabase, QPalette
+    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+    from PyQt6.QtGui import QPainter, QPen, QColor, QPalette
 except ImportError:
     print("PyQt6 not installed.\nRun: pip install PyQt6 psutil")
     sys.exit(1)
@@ -430,7 +429,7 @@ class AuditWorker(QThread):
                 out = cmd(["dscl", ".", "-list", "/Users"], timeout=8)
                 if out and "[not found]" not in out:
                     # filter hidden system users (start with _)
-                    filtered = [l for l in out.splitlines() if not l.startswith("_")]
+                    filtered = [line for line in out.splitlines() if not line.startswith("_")]
                     return "ok", "\n".join(filtered)
                 # fallback
                 try:
@@ -491,7 +490,7 @@ class AuditWorker(QThread):
             try:
                 with open(cfg_path) as f:
                     raw = f.read()
-                active = [l for l in raw.splitlines() if l.strip() and not l.strip().startswith("#")]
+                active = [line for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
                 out = "\n".join(active)
             except PermissionError:
                 return "warn", "Permission denied reading sshd_config (run as admin/root for full audit)"
@@ -547,7 +546,7 @@ class AuditWorker(QThread):
                     parts.append("=== /etc/cron.d ===\n" + cron_d)
                 try:
                     with open("/etc/crontab") as f:
-                        active = [l for l in f.read().splitlines() if l.strip() and not l.startswith("#")]
+                        active = [line for line in f.read().splitlines() if line.strip() and not line.startswith("#")]
                     if active:
                         parts.append("=== /etc/crontab ===\n" + "\n".join(active))
                 except Exception:
@@ -1050,7 +1049,7 @@ class RemediationDialog(QDialog):
         self.lbl_ai_status.setText(f"⏳  {msg}")
 
     def _on_token(self, token: str):
-        self.lbl_ai_status.setText(f"✍  Generating…")
+        self.lbl_ai_status.setText("✍  Generating…")
         cursor = self.fix_view.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(token)
@@ -1590,8 +1589,8 @@ class SecurityAuditWindow(QMainWindow):
             "error":    "✖ ERROR",
         }
         c = colors.get(status, COLORS["text2"])
-        l = labels.get(status, status.upper())
-        self.lbl_section_status.setText(l)
+        label = labels.get(status, status.upper())
+        self.lbl_section_status.setText(label)
         self.lbl_section_status.setStyleSheet(f"color:{c};font-size:11px;font-weight:bold;")
         escaped = output.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         html_lines = []
@@ -1793,10 +1792,10 @@ class SecurityAuditWindow(QMainWindow):
         for section, status, output in warnings:
             c = color.get(status, COLORS["orange"])
             ic = icon.get(status, "⚠")
-            preview_lines = [l for l in output.splitlines() if l.strip()][:6]
+            preview_lines = [line for line in output.splitlines() if line.strip()][:6]
             preview = "<br>".join(
-                f'<span style="color:{COLORS["text"]}">{l}</span>'
-                for l in preview_lines
+                f'<span style="color:{COLORS["text"]}">{line}</span>'
+                for line in preview_lines
             )
             lines.append(
                 f'<div style="margin-bottom:14px;padding:10px 12px;'
